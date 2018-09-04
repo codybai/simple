@@ -1,0 +1,229 @@
+import torch
+import time
+import numpy as np
+import os
+from torch.autograd import Variable
+from DataLoader.DataLoaderImp import DataLoaderImp
+from Loss.LossFunctionProcess import EmptyLossFunctionProcess
+from LogEditor import LogEditor
+from Loss.CreateLoss import CreateLoss
+import shutil
+import numpy as np
+from Utils.DIA_Pytorch2Caffe_Converter.main import ToCaffe
+class LoopProcess():
+    def __init__(self, opt, modelmanager, pre_p=None, group_p=None):
+        self.pre_p = pre_p
+        self.opt = opt
+        self.batchsize = opt.batch_size
+        self.group_p = group_p
+        self.need_test = opt.Test
+        self.LM = CreateLoss(opt)
+        self.loss_opt = opt.loss
+        self.MM = modelmanager
+        self.models = self.MM.getlist()
+        self.epoch = opt.epoch
+        self.save_root = opt.checkpoints
+        self.scale = int(opt.show_scale)
+        self.gpu_id_list = opt.gpu_id_list
+        self.show_iter = opt.show_iter
+        self.open_visdom = opt.open_visdom == 'This is a bad solution to show the results.'
+
+
+        self.logeditor = LogEditor(self.save_root)
+
+        if opt.continue_train or opt.Test:
+            self.Load(opt)
+
+        for m in self.models:
+            m.Adam(lr=opt.lr, betas=(0.5, 0.999))
+
+        name = self.save_root.split('/')[-1]
+        py_path = './'+name+'.py'
+        if os.path.exists(py_path):
+            print 'Save the mainfile in:'+self.save_root
+            shutil.copy(py_path,
+                        os.path.join(self.save_root,name+'.py'))
+
+    def optimiz_zero(self):
+        for optimiz in self.models:
+            optimiz.zero_grad()
+
+    def variable(self, x_list,rg = True):
+        output = [Variable(x.cuda(0),requires_grad = rg) for x in x_list]
+        return output
+
+    def Run(self, forward, cat_dim=2, ex=None):
+        self.fn = forward
+        self.ex = ex
+        self.cat_dim = cat_dim
+        if self.need_test:
+            self.Test()
+        else:
+            self.Loop()
+
+
+    def cuda(self):
+        for m in self.models:
+            m.cuda()
+        self.LM.cuda()
+        self.loss = self.LM.Create(self.loss_opt)
+        for e_ex in self.ex:
+            if hasattr(e_ex, 'cuda'):
+                e_ex.cuda()
+            elif isinstance(e_ex, list):
+                for ee in e_ex:
+                    if hasattr(ee, 'cuda'):
+                        ee.cuda()
+    def ToCaffe(self,model,image,file):
+        toface = ToCaffe()
+        toface.Converter(model,image.cpu(),self.logeditor.save_caffe,file)
+    def Test(self):
+        self.dl = DataLoaderImp(self.opt, self.pre_p, self.group_p)
+        self.cuda()
+        len_dl = len(self.dl.data_iter)
+        e_loss = EmptyLossFunctionProcess()
+        for m in self.models:
+            m.isTest = True
+        count = 0
+        for data, p in (self.dl.data_iter):
+            input = self.variable(data,False)
+            if self.opt.ToCaffe == True:
+                for m in self.models:
+                    m.isCaffe = True
+                self.fn(input,
+                        self.models,
+                        e_loss,
+                        self.ex)
+                for id,m in enumerate(self.models):
+                    self.ToCaffe(m,m.Input,str(id))
+
+                break
+            start_t = time.time()
+            Log_dict = self.fn(input,
+                               self.models,
+                               e_loss,
+                               self.ex)
+            self.logeditor.Finder(Log_dict,
+                                  p[0], 0, count,
+                                  len_dl,
+                                  time.time() - start_t,
+                                  self.cat_dim
+                                  )
+            count += 1
+        for m in self.models:
+            m.isTest = False
+
+    def Loop(self):
+        count = 0
+        self.dl = DataLoaderImp(self.opt, self.pre_p, self.group_p)
+        self.cuda()
+        len_dl = len(self.dl.data_iter)
+        start_t = time.time()
+        data_buffer = []
+
+        for e in range(self.epoch):
+            for i, data in enumerate(self.dl.data_iter):
+                if len(data_buffer)==128:
+                    rank = self.loss.Rank()
+                    for ii in rank[:64]:
+                        input = data_buffer[ii]
+                        self.fn(
+                            input,
+                            self.models,
+                            self.loss,
+                            self.models,
+                            self.ex
+                        )
+                        print 'rank:',ii
+                    data_buffer = []
+
+                if data[0].size()[0] != self.batchsize:
+                    continue
+                input = self.variable(data)
+                self.optimiz_zero()
+
+                Log_dict = self.fn(input,
+                                   self.models,
+                                   self.loss,
+                                   self.models,
+                                   self.ex
+                                   )
+
+                if Log_dict is None:
+                    continue
+
+                count += 1
+                self.logeditor.PrintLog(
+                    Log_dict, e, i, len_dl,
+                    (time.time() - start_t) / (count + 1))
+                if self.opt.hardcase:
+                    data_buffer.append(input)
+                    self.loss.Record(len(data_buffer) - 1)
+
+                if count % self.show_iter == 1:
+                    start_local = time.time()
+                    self.logeditor.Shower(
+                        Log_dict,
+                        self.cat_dim,
+                        e, count, len_dl)
+                    print 'others:', time.time() - start_local
+                if count % (self.show_iter * 10) == 1:
+                    start_local = time.time()
+                    self.Save('epoch_' + str(e))
+                    self.Save('latest')
+                    print 'save models time:', time.time() - start_local
+
+    def Save(self, count):
+        self.MM.Save(count)
+
+    def Load(self, opt):
+        count_str = 'latest'
+        if hasattr(opt, 'epoch_model') and opt.epoch_model >= 0:
+            count_str = 'epoch_' + str(opt.epoch_model)
+        self.MM.Load(count_str)
+
+
+if __name__ == '__main__':
+    __file_name__ = __file__.split('/')[-1]
+    task_name = __file_name__.replace('.py', '')
+    os.environ['TORCH_MODEL_ZOO'] = __file__.replace(__file_name__,
+                                                     'TORCH_MODEL_ZOO')
+    from Option.OptionBase import OptionBase
+
+    opt = OptionBase({
+        'Root': '/root/group-dia/wx/DIA/gen/disney/iteration_v12/girl/v2_v3_combined_sy',
+        'key_name': '/A',
+        'input_dir': '/A,'
+                     '/super_mask,'
+                     '/AP,'
+                     '/gt_sem_mask',
+
+        'TestRoot': '/root/group-dia/image-site/200testwithmask_milk',
+        'Testkey_name': '_input',
+        'Testinput_dir': '_input,'
+                         '_hairmask,'
+                         '_out.png_ashura0122,'
+                         '_hairmask',
+        'Test': False,
+
+        'batch_size': 1,
+        'continue_train': True,
+        'vggLayerNames': 'conv3_1,'
+                         'conv4_1,conv4_2,'
+                         'conv4_4',
+
+        'loss': '0.1*VGG(O_1,T_1)-'
+                '10000*L2(O_1,T_1)',
+
+        'gpu_id_list': [0],
+        'max_batch': 1e8,
+        'epoch': 1000,
+        'show_iter': 10,
+        'checkpoints': '/root/group-dia/wssy/CheckPointsTemp/' + task_name,
+    })
+    from Loss.CreateLoss import CreateLoss
+    from Utils.LogManager.LogManager import LogManager
+
+    thvis = LogManager(opt)
+
+    thvis.Display_Image(np.zeros((3, 3, 3)))  # im.transpose(2,0,1))
